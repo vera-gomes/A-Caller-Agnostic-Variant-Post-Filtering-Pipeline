@@ -35,7 +35,6 @@ The pipeline was designed to:
   Main implementation of the full post-filtering workflow. This script contains the executable logic for feature extraction, truth labeling, model training, cross-validation, tranche analysis, per-variant classification, uniquely correct TP/TN analyses, and bootstrap confidence intervals.
 
 - **`pipeline_full_aux.py`**  
-  Pseudocode and logic guide to the main pipeline. This file is not intended to replace `pipeline_full.py`; instead, it explains the workflow step by step in a simplified and more readable form, helping readers understand the pipeline structure, dependencies, and analytical flow before examining the full implementation.
+  Pseudocode and logic guide to the main pipeline. This file is not intended to replace `pipeline_full.py`; instead, it explains the workflow step by step in a simplified and more readable form, helping readers understand the pipeline structure, dependencies, and analytical flow, making also easier to adapt the logic to specific contexts.
 
-> In short: **`pipeline_full_aux.py` explains the pipeline, while `pipeline_full.py` executes it.**
 
