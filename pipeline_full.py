@@ -10,6 +10,8 @@ Included functionality
 - VCF annotation extraction
 - Truth-set labeling
 - Feature selection and cleaning
+- Missingness audit with configurable drop threshold
+- Fold-aware (leakage-free) column-mean imputation
 - Stratified cross-validation
 - GM, BGM, LR, RF, LGB, and Bayesian-optimized LGB support
 - Fold-level and averaged evaluation summaries
@@ -17,7 +19,17 @@ Included functionality
 - Tranche analysis
 - Per-variant classification output
 - Unique TP/TN analysis across models
-- Bootstrap confidence intervals for metrics
+- Bootstrap confidence intervals for metrics (B=2000, percentile method)
+
+Scientific rigor notes
+----------------------
+- Imputation is computed exclusively on the training partition of each fold
+  and applied to the validation partition, preventing information leakage.
+- Features with missingness exceeding MISSINGNESS_THRESHOLD (default 30%) are
+  dropped prior to cross-validation and logged in missingness_audit.csv.
+- All models share identical stratified splits (random_state fixed) for
+  strict comparability.
+- Bootstrap 95% CIs are reported for AUC, precision, recall, F1, and accuracy.
 
 Notes
 -----
@@ -77,6 +89,15 @@ except Exception:
 
 
 # =============================================================================
+# Global scientific constants
+# =============================================================================
+
+# Features with missingness rate strictly above this threshold are excluded
+# prior to cross-validation. Value of 0.30 means >30% missing → dropped.
+MISSINGNESS_THRESHOLD: float = 0.30
+
+
+# =============================================================================
 # Configuration
 # =============================================================================
 
@@ -94,6 +115,7 @@ class PipelineConfig:
     label_column: str = "TruthLabel"
     random_state: int = 42
     n_splits: int = 5
+    missingness_threshold: float = MISSINGNESS_THRESHOLD
     gm_components: int = 5
     gm_max_iter: int = 500
     bgm_max_iter: int = 1000
@@ -240,28 +262,185 @@ def label_variants_against_truth(
 
 
 def select_usable_features(df: pd.DataFrame, desired_features: Sequence[str]) -> List[str]:
+    """
+    Retain features that exist in the DataFrame and have at least one
+    non-NaN value. Entirely absent or all-NaN columns are dropped here;
+    the missingness threshold (>30%) is applied separately via
+    audit_missingness().
+    """
     usable = [c for c in desired_features if c in df.columns and df[c].notna().any()]
     dropped = [c for c in desired_features if c not in usable]
-    logging.info("Selected features: %s", usable)
+    logging.info("Initially selected features: %s", usable)
     if dropped:
-        logging.warning("Dropped unavailable or empty features: %s", dropped)
+        logging.warning("Dropped unavailable or entirely-NaN features: %s", dropped)
     if not usable:
         raise ValueError("No usable features were found.")
     return usable
+
+
+def audit_missingness(
+    df: pd.DataFrame,
+    feature_columns: Sequence[str],
+    threshold: float = MISSINGNESS_THRESHOLD,
+) -> Tuple[List[str], pd.DataFrame]:
+    """
+    Compute per-feature missingness rates and drop features whose missing
+    fraction exceeds `threshold`.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Labeled variant DataFrame (full dataset, before splitting).
+    feature_columns : sequence of str
+        Candidate feature names to audit.
+    threshold : float
+        Maximum tolerated missing fraction (default 0.30 → 30%).
+
+    Returns
+    -------
+    retained : list of str
+        Feature names that pass the threshold.
+    audit_df : pd.DataFrame
+        Audit table with columns: feature, n_total, n_missing,
+        missing_pct, retained.
+    """
+    n_total = len(df)
+    rows = []
+    retained: List[str] = []
+
+    for col in feature_columns:
+        n_missing = int(df[col].isna().sum())
+        rate = n_missing / n_total if n_total > 0 else 0.0
+        keep = rate <= threshold
+        rows.append(
+            {
+                "feature": col,
+                "n_total": n_total,
+                "n_missing": n_missing,
+                "missing_pct": round(rate * 100, 2),
+                "retained": keep,
+            }
+        )
+        if keep:
+            retained.append(col)
+
+    audit_df = pd.DataFrame(rows)
+    dropped = audit_df[~audit_df["retained"]]["feature"].tolist()
+
+    logging.info(
+        "Missingness audit (threshold=%.0f%%):\n%s",
+        threshold * 100,
+        audit_df.to_string(index=False),
+    )
+    if dropped:
+        logging.warning(
+            "Excluded %d feature(s) exceeding %.0f%% missingness threshold: %s",
+            len(dropped),
+            threshold * 100,
+            dropped,
+        )
+    if not retained:
+        raise ValueError(
+            f"All features were dropped by the missingness threshold ({threshold:.0%}). "
+            "Consider raising --missingness_threshold."
+        )
+
+    logging.info("Retained features after missingness audit: %s", retained)
+    return retained, audit_df
 
 
 def clean_feature_matrix(
     df: pd.DataFrame,
     feature_columns: Sequence[str],
     return_clean_df: bool = False,
-) -> np.ndarray | Tuple[pd.DataFrame, np.ndarray]:
+) -> "np.ndarray | Tuple[pd.DataFrame, np.ndarray]":
+    """
+    Replace infinite values with NaN and convert to a float32 NumPy array.
+
+    IMPORTANT — imputation is intentionally NOT performed here.
+    Column-mean imputation is applied fold-by-fold inside
+    cross_validation_evaluation() via fold_aware_impute() to prevent
+    information leakage from the validation partition into the training
+    imputation means.
+    """
     cleaned = df.copy()
-    cleaned[list(feature_columns)] = cleaned[list(feature_columns)].replace([np.inf, -np.inf], np.nan)
-    for col in feature_columns:
-        mean_value = cleaned[col].mean()
-        cleaned[col] = cleaned[col].fillna(mean_value)
+    cleaned[list(feature_columns)] = cleaned[list(feature_columns)].replace(
+        [np.inf, -np.inf], np.nan
+    )
     X = cleaned[list(feature_columns)].to_numpy(dtype=np.float32)
     return (cleaned, X) if return_clean_df else X
+
+
+def fold_aware_impute(
+    X_train: np.ndarray,
+    X_val: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Leakage-free column-mean imputation.
+
+    Column means are estimated exclusively from `X_train`. Those means
+    are then applied to fill NaN values in both `X_train` and `X_val`.
+    This ensures no statistical information from the validation partition
+    influences the imputed values, in accordance with rigorous
+    cross-validation methodology.
+
+    If a column is entirely NaN in the training partition (edge case),
+    the fallback imputation value is 0.0, and a warning is emitted.
+
+    Parameters
+    ----------
+    X_train : np.ndarray, shape (n_train, n_features)
+        Training feature matrix, may contain NaN.
+    X_val : np.ndarray, shape (n_val, n_features)
+        Validation feature matrix, may contain NaN.
+
+    Returns
+    -------
+    X_train_imp : np.ndarray
+        Imputed training matrix.
+    X_val_imp : np.ndarray
+        Imputed validation matrix using training means only.
+    """
+    train_means = np.nanmean(X_train, axis=0)
+
+    # Handle columns entirely NaN in training (edge case)
+    all_nan_cols = np.where(np.isnan(train_means))[0]
+    if len(all_nan_cols) > 0:
+        logging.warning(
+            "Column(s) %s are entirely NaN in this training fold; imputing with 0.0.",
+            all_nan_cols.tolist(),
+        )
+        train_means = np.where(np.isnan(train_means), 0.0, train_means)
+
+    def _apply_imputation(X: np.ndarray, means: np.ndarray) -> np.ndarray:
+        X_out = X.copy()
+        for j in range(X_out.shape[1]):
+            nan_mask = np.isnan(X_out[:, j])
+            if nan_mask.any():
+                X_out[nan_mask, j] = means[j]
+        return X_out
+
+    X_train_imp = _apply_imputation(X_train, train_means)
+    X_val_imp = _apply_imputation(X_val, train_means)
+    return X_train_imp, X_val_imp
+
+
+def impute_full_dataset(X: np.ndarray) -> np.ndarray:
+    """
+    Column-mean imputation on the full dataset.
+
+    Used only when training final models on the complete labeled set
+    (outside cross-validation). No leakage concern applies here as
+    there is no held-out split.
+    """
+    means = np.nanmean(X, axis=0)
+    means = np.where(np.isnan(means), 0.0, means)
+    X_out = X.copy()
+    for j in range(X_out.shape[1]):
+        nan_mask = np.isnan(X_out[:, j])
+        if nan_mask.any():
+            X_out[nan_mask, j] = means[j]
+    return X_out
 
 
 def extract_target_vector(df: pd.DataFrame, label_column: str) -> np.ndarray:
@@ -405,7 +584,11 @@ def bayesian_optimize_lightgbm(
     return optimizer.best_estimator_
 
 
-def fit_mixture_models(config: PipelineConfig, X_train: np.ndarray, y_train: np.ndarray) -> Dict[str, Tuple[Any, Any]]:
+def fit_mixture_models(
+    config: PipelineConfig,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+) -> Dict[str, Tuple[Any, Any]]:
     X_good = X_train[y_train == 1]
     X_bad = X_train[y_train == 0]
     if len(X_good) == 0 or len(X_bad) == 0:
@@ -438,9 +621,16 @@ def fit_mixture_models(config: PipelineConfig, X_train: np.ndarray, y_train: np.
     return {"GM": (gm_good, gm_bad), "BGM": (bgm_good, bgm_bad)}
 
 
-def fit_classifier_models(config: PipelineConfig, X_train: np.ndarray, y_train: np.ndarray) -> Dict[str, Any]:
+def fit_classifier_models(
+    config: PipelineConfig,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+) -> Dict[str, Any]:
     models: Dict[str, Any] = {
-        "LR": LogisticRegression(max_iter=1000, random_state=config.random_state).fit(X_train, y_train),
+        "LR": LogisticRegression(
+            max_iter=1000,
+            random_state=config.random_state,
+        ).fit(X_train, y_train),
         "RF": RandomForestClassifier(
             n_estimators=config.rf_n_estimators,
             max_depth=config.rf_max_depth,
@@ -473,6 +663,11 @@ def train_models_on_training_data(
     X_train: np.ndarray,
     y_train: np.ndarray,
 ) -> Dict[str, Any]:
+    """
+    Fit all models on a pre-imputed, pre-split training partition.
+    X_train must already be imputed (via fold_aware_impute or
+    impute_full_dataset) before calling this function.
+    """
     models: Dict[str, Any] = {}
     models.update(fit_mixture_models(config, X_train, y_train))
     models.update(fit_classifier_models(config, X_train, y_train))
@@ -495,7 +690,25 @@ def cross_validation_evaluation(
     X_all: np.ndarray,
     y_all: np.ndarray,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, List[Dict[str, Any]]]]:
-    logging.info("Starting %d-fold stratified CV", config.n_splits)
+    """
+    Stratified k-fold cross-validation with fold-aware imputation.
+
+    For each fold:
+      1. Split indices into train / validation.
+      2. Apply fold_aware_impute() — means computed on training partition
+         only, then applied to both partitions.
+      3. Fit all models on the imputed training data.
+      4. Evaluate on the imputed validation data.
+
+    This design guarantees that no information from the validation
+    partition leaks into preprocessing, consistent with rigorous
+    cross-validation methodology.
+    """
+    logging.info(
+        "Starting %d-fold stratified CV (random_state=%d)",
+        config.n_splits,
+        config.random_state,
+    )
     skf = StratifiedKFold(
         n_splits=config.n_splits,
         shuffle=True,
@@ -503,14 +716,23 @@ def cross_validation_evaluation(
     )
 
     fold_records: List[Dict[str, Any]] = []
-    metrics_all: Dict[str, List[Dict[str, Any]]] = {k: [] for k in build_model_registry(config).keys()}
+    metrics_all: Dict[str, List[Dict[str, Any]]] = {
+        k: [] for k in build_model_registry(config).keys()
+    }
 
     for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X_all, y_all), start=1):
-        logging.info("Processing fold %d", fold_idx)
-        X_train, X_val = X_all[train_idx], X_all[val_idx]
+        logging.info("Processing fold %d / %d", fold_idx, config.n_splits)
+
+        X_train_raw, X_val_raw = X_all[train_idx], X_all[val_idx]
         y_train, y_val = y_all[train_idx], y_all[val_idx]
 
+        # ------------------------------------------------------------------ #
+        # Fold-aware imputation: means derived from training partition only.  #
+        # ------------------------------------------------------------------ #
+        X_train, X_val = fold_aware_impute(X_train_raw, X_val_raw)
+
         fitted_models = train_models_on_training_data(config, X_train, y_train)
+
         for model_name, model_obj in fitted_models.items():
             scores = score_model(model_name, model_obj, X_val)
             metrics = compute_binary_metrics(y_val, scores, threshold_strategy="youden")
@@ -529,7 +751,7 @@ def cross_validation_evaluation(
             fold_records.append(record)
             metrics_all[model_name].append(record)
             logging.info(
-                "Fold %d | %s | AUC=%.4f Precision=%.4f Recall=%.4f F1=%.4f Accuracy=%.4f Threshold=%.4f",
+                "Fold %d | %-12s | AUC=%.4f  Prec=%.4f  Rec=%.4f  F1=%.4f  Acc=%.4f  Thr=%.4f",
                 fold_idx,
                 model_name,
                 metrics["auc"],
@@ -553,10 +775,15 @@ def cross_validation_evaluation(
                 "dataset": config.dataset_name,
                 "model": model_name,
                 "average_auc": rdf["auc"].mean(),
+                "std_auc": rdf["auc"].std(),
                 "average_precision": rdf["precision"].mean(),
+                "std_precision": rdf["precision"].std(),
                 "average_recall": rdf["recall"].mean(),
+                "std_recall": rdf["recall"].std(),
                 "average_f1": rdf["f1"].mean(),
+                "std_f1": rdf["f1"].std(),
                 "average_accuracy": rdf["accuracy"].mean(),
+                "std_accuracy": rdf["accuracy"].std(),
                 "average_optimal_threshold": rdf["optimal_threshold"].mean(),
             }
         )
@@ -570,9 +797,20 @@ def cross_validation_evaluation(
 # =============================================================================
 
 
-def train_final_models(config: PipelineConfig, X_all: np.ndarray, y_all: np.ndarray) -> Dict[str, Any]:
-    logging.info("Training final models on full dataset")
-    return train_models_on_training_data(config, X_all, y_all)
+def train_final_models(
+    config: PipelineConfig,
+    X_all: np.ndarray,
+    y_all: np.ndarray,
+) -> Dict[str, Any]:
+    """
+    Train final models on the complete dataset.
+
+    Full-dataset column-mean imputation (impute_full_dataset) is applied
+    here. No leakage concern applies because there is no held-out split.
+    """
+    logging.info("Training final models on full dataset (with full-dataset imputation)")
+    X_imputed = impute_full_dataset(X_all)
+    return train_models_on_training_data(config, X_imputed, y_all)
 
 
 def save_models(models: Dict[str, Any], models_dir: Path) -> Dict[str, str]:
@@ -650,7 +888,12 @@ def plot_tranche_metrics(tranche_df: pd.DataFrame, plots_dir: Path) -> List[str]
     return saved
 
 
-def plot_roc_curves(models: Dict[str, Any], X_all: np.ndarray, y_all: np.ndarray, plots_dir: Path) -> str:
+def plot_roc_curves(
+    models: Dict[str, Any],
+    X_all: np.ndarray,
+    y_all: np.ndarray,
+    plots_dir: Path,
+) -> str:
     plt.figure(figsize=(7, 6))
     for model_name, model_obj in models.items():
         scores = score_model(model_name, model_obj, X_all)
@@ -725,13 +968,19 @@ def classify_variants_for_all_models(
 
 def summarize_variant_classification(classification_df: pd.DataFrame) -> pd.DataFrame:
     return (
-        classification_df.groupby(["caller", "dataset", "model", "status", "VariantType"], dropna=False)
+        classification_df
+        .groupby(
+            ["caller", "dataset", "model", "status", "VariantType"],
+            dropna=False,
+        )
         .size()
         .reset_index(name="count")
     )
 
 
-def analyze_unique_correct_variants(classification_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def analyze_unique_correct_variants(
+    classification_df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     pivoted_status = classification_df.pivot_table(
         index=["variant_id", "CHROM", "POS", "REF", "ALT", "VariantType", "TruthLabel"],
         columns="model",
@@ -777,7 +1026,7 @@ def analyze_unique_correct_variants(classification_df: pd.DataFrame) -> Tuple[pd
 
 
 # =============================================================================
-# Bootstrap utilities retained from analysis_suite.py scope
+# Bootstrap confidence intervals
 # =============================================================================
 
 
@@ -863,6 +1112,36 @@ def bootstrap_confidence_intervals_from_table(
     n_boot: int = 2000,
     seed: int = 123,
 ) -> pd.DataFrame:
+    """
+    Compute 95% bootstrap confidence intervals (percentile method) for
+    each metric within each group defined by group_cols.
+
+    Resampling strategy:
+      - If fold-level counts (TP/FP/FN) are present: resample folds with
+        replacement and aggregate counts per bootstrap replicate.
+      - If variant-level status labels are present: resample variants with
+        replacement and recompute confusion-matrix metrics per replicate.
+      - Otherwise: resample rows (fold-level metric values) with
+        replacement and take the column mean per replicate.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input table (fold-level metrics or variant-level classifications).
+    group_cols : sequence of str
+        Columns to group by (e.g. ['model', 'caller']).
+    metric_cols : sequence of str
+        Metric names to bootstrap (e.g. ['auc', 'f1', 'precision']).
+    n_boot : int
+        Number of bootstrap replicates (default 2000).
+    seed : int
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: group keys + ['metric', 'mean', 'ci95_lo', 'ci95_hi'].
+    """
     df = _normalize_columns(df)
     rng = np.random.RandomState(seed)
 
@@ -940,7 +1219,9 @@ def bootstrap_confidence_intervals_from_table(
             boot_metrics = []
             for _ in range(n_boot):
                 sel = rng.choice(np.arange(n), size=n, replace=True)
-                boot_metrics.append(dict(zip(present_metrics, np.nanmean(values[sel], axis=0))))
+                boot_metrics.append(
+                    dict(zip(present_metrics, np.nanmean(values[sel], axis=0)))
+                )
 
         if not boot_metrics:
             continue
@@ -973,38 +1254,90 @@ def save_dataframe(df: pd.DataFrame, path: Path) -> str:
 
 
 def run_full_pipeline(config: PipelineConfig) -> Dict[str, Any]:
+    """
+    End-to-end pipeline with full scientific rigor controls:
+
+    1. Extract VCF annotations and label against truth set.
+    2. Select initially usable features (non-empty columns).
+    3. Audit missingness: drop features exceeding config.missingness_threshold.
+    4. Convert to float32 NumPy array (inf → NaN; no imputation yet).
+    5. Cross-validate with fold-aware imputation (no leakage).
+    6. Train final models with full-dataset imputation.
+    7. Tranche analysis, ROC plots, variant classification, bootstrap CIs.
+    """
     started = time.time()
     paths = initialize_project_environment(config)
 
+    # -- Data extraction and labeling ----------------------------------------
     annotations = extract_annotations_from_vcf(config.input_vcf, config.desired_features)
     truth_positions = extract_truth_positions(config.truth_vcf)
     labeled = label_variants_against_truth(annotations, truth_positions, config.label_column)
+
+    # -- Feature selection and missingness audit ------------------------------
     feature_columns = select_usable_features(labeled, config.desired_features)
+    feature_columns, missingness_audit = audit_missingness(
+        labeled,
+        feature_columns,
+        threshold=config.missingness_threshold,
+    )
+
+    outputs: Dict[str, Any] = {"features": feature_columns}
+    outputs["missingness_audit_csv"] = save_dataframe(
+        missingness_audit,
+        paths["tables"] / "missingness_audit.csv",
+    )
+
+    # -- Build feature matrix (inf→NaN; imputation deferred to fold level) ---
     labeled_clean, X_all = clean_feature_matrix(labeled, feature_columns, return_clean_df=True)
     y_all = extract_target_vector(labeled_clean, config.label_column)
-
-    outputs: Dict[str, Any] = {
-        "features": feature_columns,
-    }
 
     outputs["annotations_labeled_csv"] = save_dataframe(
         labeled_clean,
         paths["tables"] / "annotations_labeled.csv",
     )
 
-    fold_df, summary_df, _ = cross_validation_evaluation(config, X_all, y_all)
-    outputs["cv_fold_metrics_csv"] = save_dataframe(fold_df, paths["tables"] / "cv_fold_metrics.csv")
-    outputs["cv_summary_csv"] = save_dataframe(summary_df, paths["tables"] / "cv_evaluation_summary.csv")
+    logging.info(
+        "Dataset summary: %d variants | %d positives (%.1f%%) | %d negatives (%.1f%%)",
+        len(y_all),
+        int(y_all.sum()),
+        100.0 * y_all.mean(),
+        int((y_all == 0).sum()),
+        100.0 * (1 - y_all.mean()),
+    )
 
+    # -- Cross-validation (fold-aware imputation inside) ----------------------
+    fold_df, summary_df, _ = cross_validation_evaluation(config, X_all, y_all)
+    outputs["cv_fold_metrics_csv"] = save_dataframe(
+        fold_df,
+        paths["tables"] / "cv_fold_metrics.csv",
+    )
+    outputs["cv_summary_csv"] = save_dataframe(
+        summary_df,
+        paths["tables"] / "cv_evaluation_summary.csv",
+    )
+
+    # -- Final models (full-dataset imputation) --------------------------------
     final_models = train_final_models(config, X_all, y_all)
     outputs["model_paths"] = save_models(final_models, paths["models"])
 
-    tranche_df = run_tranche_analysis(config, final_models, X_all, y_all)
-    outputs["tranche_metrics_csv"] = save_dataframe(tranche_df, paths["tables"] / "tranche_metrics.csv")
-    outputs["tranche_plots"] = plot_tranche_metrics(tranche_df, paths["plots"])
-    outputs["roc_plot"] = plot_roc_curves(final_models, X_all, y_all, paths["plots"])
+    # Need imputed X for downstream scoring
+    X_all_imputed = impute_full_dataset(X_all)
 
-    classification_df = classify_variants_for_all_models(config, labeled_clean, X_all, y_all, final_models)
+    # -- Tranche analysis and plots -------------------------------------------
+    tranche_df = run_tranche_analysis(config, final_models, X_all_imputed, y_all)
+    outputs["tranche_metrics_csv"] = save_dataframe(
+        tranche_df,
+        paths["tables"] / "tranche_metrics.csv",
+    )
+    outputs["tranche_plots"] = plot_tranche_metrics(tranche_df, paths["plots"])
+    outputs["roc_plot"] = plot_roc_curves(
+        final_models, X_all_imputed, y_all, paths["plots"]
+    )
+
+    # -- Per-variant classification -------------------------------------------
+    classification_df = classify_variants_for_all_models(
+        config, labeled_clean, X_all_imputed, y_all, final_models
+    )
     outputs["variant_classification_csv"] = save_dataframe(
         classification_df,
         paths["variants"] / "variant_classification_by_model.csv",
@@ -1016,6 +1349,7 @@ def run_full_pipeline(config: PipelineConfig) -> Dict[str, Any]:
         paths["variants"] / "variant_classification_summary.csv",
     )
 
+    # -- Unique TP/TN analysis ------------------------------------------------
     unique_long, unique_summary = analyze_unique_correct_variants(classification_df)
     outputs["unique_tp_tn_long_csv"] = save_dataframe(
         unique_long,
@@ -1026,6 +1360,7 @@ def run_full_pipeline(config: PipelineConfig) -> Dict[str, Any]:
         paths["variants"] / "unique_tp_tn_summary.csv",
     )
 
+    # -- Bootstrap confidence intervals (B=2000, percentile method) -----------
     bootstrap_df = bootstrap_confidence_intervals_from_table(
         fold_df,
         group_cols=[c for c in ["caller", "dataset", "model"] if c in fold_df.columns],
@@ -1045,11 +1380,14 @@ def run_full_pipeline(config: PipelineConfig) -> Dict[str, Any]:
 
 
 # =============================================================================
-# Optional McNemar utility retained as helper only if needed later
+# Optional McNemar utility
 # =============================================================================
 
 
-def mcnemar_test_from_status(a_status: np.ndarray, b_status: np.ndarray) -> Tuple[float, float, int, int]:
+def mcnemar_test_from_status(
+    a_status: np.ndarray,
+    b_status: np.ndarray,
+) -> Tuple[float, float, int, int]:
     a_correct = np.isin(a_status, ["TP", "TN"])
     b_correct = np.isin(b_status, ["TP", "TN"])
     b01 = int(np.sum((a_correct == True) & (b_correct == False)))
@@ -1067,7 +1405,10 @@ def mcnemar_test_from_status(a_status: np.ndarray, b_status: np.ndarray) -> Tupl
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Consolidated variant filtering pipeline")
+    parser = argparse.ArgumentParser(
+        description="Consolidated variant filtering pipeline",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument("--input_vcf", required=True, help="Input VCF path")
     parser.add_argument("--truth_vcf", required=True, help="Truth VCF path")
     parser.add_argument("--output_dir", required=True, help="Output directory")
@@ -1082,6 +1423,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--label_column", default="TruthLabel")
     parser.add_argument("--random_state", type=int, default=42)
     parser.add_argument("--n_splits", type=int, default=5)
+    parser.add_argument(
+        "--missingness_threshold",
+        type=float,
+        default=MISSINGNESS_THRESHOLD,
+        help=(
+            "Maximum fraction of missing values allowed per feature before "
+            "it is excluded (default: 0.30 → 30%%)."
+        ),
+    )
     parser.add_argument("--gm_components", type=int, default=5)
     parser.add_argument("--gm_max_iter", type=int, default=500)
     parser.add_argument("--bgm_max_iter", type=int, default=1000)
@@ -1109,6 +1459,7 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         label_column=args.label_column,
         random_state=args.random_state,
         n_splits=args.n_splits,
+        missingness_threshold=args.missingness_threshold,
         gm_components=args.gm_components,
         gm_max_iter=args.gm_max_iter,
         bgm_max_iter=args.bgm_max_iter,
