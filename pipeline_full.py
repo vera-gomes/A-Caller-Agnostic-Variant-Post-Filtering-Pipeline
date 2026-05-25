@@ -117,8 +117,43 @@ class PipelineConfig:
     n_splits: int = 5
     missingness_threshold: float = MISSINGNESS_THRESHOLD
     gm_components: int = 5
+
+    # -------------------------------------------------------------------------
+    # GMM hyperparameters
+    # GMM is fitted via the standard Expectation-Maximisation (EM) algorithm,
+    # which alternates between two closed-form steps. Training stops as soon
+    # as the per-iteration improvement in the observed log-likelihood falls
+    # below gm_tol, or when gm_max_iter iterations are reached — whichever
+    # comes first. gm_max_iter is therefore a safety ceiling, not the primary
+    # stopping criterion.
+    # -------------------------------------------------------------------------
     gm_max_iter: int = 500
+    gm_tol: float = 1e-3  # Convergence tolerance for GMM (log-likelihood improvement)
+
+    # -------------------------------------------------------------------------
+    # BGM hyperparameters
+    # BGM is fitted via variational Bayesian EM, which must additionally update
+    # the posterior over the Dirichlet weight prior at every iteration. This
+    # extra variational update makes each iteration more expensive and slows
+    # overall convergence relative to standard EM, which is why a higher
+    # iteration ceiling is used (1000 vs 500 for GMM). As with GMM, training
+    # stops early if the per-iteration improvement in the evidence lower bound
+    # (ELBO) falls below bgm_tol.
+    # -------------------------------------------------------------------------
     bgm_max_iter: int = 1000
+    bgm_tol: float = 1e-3  # Convergence tolerance for BGM (ELBO improvement)
+
+    # -------------------------------------------------------------------------
+    # BGM Dirichlet weight-concentration prior
+    # A value much smaller than 1 is sparsity-inducing: it places most prior
+    # mass on distributions where only a few components carry substantial
+    # weight. Components with weak data support will have their mixing
+    # coefficients shrunk toward zero, effectively reducing the active model
+    # complexity and preventing the retention of uninformative ("phantom")
+    # components.
+    # -------------------------------------------------------------------------
+    bgm_weight_concentration_prior: float = 1e-2
+
     bootstrap_iterations: int = 2000
     tranche_sensitivities: List[float] = field(default_factory=lambda: [1.0, 0.999, 0.99, 0.90])
     bayes_cv_splits: int = 3
@@ -589,33 +624,59 @@ def fit_mixture_models(
     X_train: np.ndarray,
     y_train: np.ndarray,
 ) -> Dict[str, Tuple[Any, Any]]:
+    """
+    Fit GMM and BGM density estimators separately on positive (y=1) and
+    negative (y=0) training variants.
+
+    Both models are iterative and share the same stopping logic:
+      - Training halts when the per-iteration improvement in the
+        log-likelihood lower bound falls below the configured tolerance
+        (gm_tol / bgm_tol), OR when the maximum iteration ceiling is
+        reached — whichever comes first.
+      - The iteration ceilings differ (GMM: gm_max_iter=500,
+        BGM: bgm_max_iter=1000) because BGM uses variational Bayesian EM,
+        which must additionally update the posterior over the Dirichlet
+        weight prior at every step, making each iteration more expensive
+        and overall convergence slower than the standard EM used for GMM.
+
+    The BGM Dirichlet weight-concentration prior (bgm_weight_concentration_prior,
+    default 1e-2) is sparsity-inducing: values << 1 shrink the mixing
+    weights of weakly supported components toward zero, preventing the
+    model from retaining uninformative ("phantom") components.
+    """
     X_good = X_train[y_train == 1]
     X_bad = X_train[y_train == 0]
     if len(X_good) == 0 or len(X_bad) == 0:
         raise ValueError("Both positive and negative classes are required for mixture models.")
 
+    # -- GMM: standard EM, converges in fewer iterations ---------------------
     gm_good = GaussianMixture(
         n_components=config.gm_components,
         max_iter=config.gm_max_iter,
+        tol=config.gm_tol,
         random_state=config.random_state,
     ).fit(X_good)
     gm_bad = GaussianMixture(
         n_components=config.gm_components,
         max_iter=config.gm_max_iter,
+        tol=config.gm_tol,
         random_state=config.random_state,
     ).fit(X_bad)
 
+    # -- BGM: variational Bayesian EM, higher iteration ceiling warranted ----
     bgm_good = BayesianGaussianMixture(
         n_components=config.gm_components,
         max_iter=config.bgm_max_iter,
+        tol=config.bgm_tol,
+        weight_concentration_prior=config.bgm_weight_concentration_prior,
         random_state=config.random_state,
-        weight_concentration_prior=1e-2,
     ).fit(X_good)
     bgm_bad = BayesianGaussianMixture(
         n_components=config.gm_components,
         max_iter=config.bgm_max_iter,
+        tol=config.bgm_tol,
+        weight_concentration_prior=config.bgm_weight_concentration_prior,
         random_state=config.random_state,
-        weight_concentration_prior=1e-2,
     ).fit(X_bad)
 
     return {"GM": (gm_good, gm_bad), "BGM": (bgm_good, bgm_bad)}
@@ -1433,8 +1494,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--gm_components", type=int, default=5)
-    parser.add_argument("--gm_max_iter", type=int, default=500)
-    parser.add_argument("--bgm_max_iter", type=int, default=1000)
+    parser.add_argument(
+        "--gm_max_iter",
+        type=int,
+        default=500,
+        help="Maximum EM iterations for GMM (training stops earlier if gm_tol is reached).",
+    )
+    parser.add_argument(
+        "--gm_tol",
+        type=float,
+        default=1e-3,
+        help="Convergence tolerance for GMM (log-likelihood improvement per iteration).",
+    )
+    parser.add_argument(
+        "--bgm_max_iter",
+        type=int,
+        default=1000,
+        help=(
+            "Maximum variational EM iterations for BGM. Higher than GMM because "
+            "variational Bayesian inference converges more slowly than standard EM."
+        ),
+    )
+    parser.add_argument(
+        "--bgm_tol",
+        type=float,
+        default=1e-3,
+        help="Convergence tolerance for BGM (ELBO improvement per iteration).",
+    )
+    parser.add_argument(
+        "--bgm_weight_concentration_prior",
+        type=float,
+        default=1e-2,
+        help=(
+            "Dirichlet weight-concentration prior for BGM. Values << 1 are "
+            "sparsity-inducing: weakly supported components shrink toward zero."
+        ),
+    )
     parser.add_argument("--bootstrap_iterations", type=int, default=2000)
     parser.add_argument(
         "--tranche_sensitivities",
@@ -1462,7 +1557,10 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         missingness_threshold=args.missingness_threshold,
         gm_components=args.gm_components,
         gm_max_iter=args.gm_max_iter,
+        gm_tol=args.gm_tol,
         bgm_max_iter=args.bgm_max_iter,
+        bgm_tol=args.bgm_tol,
+        bgm_weight_concentration_prior=args.bgm_weight_concentration_prior,
         bootstrap_iterations=args.bootstrap_iterations,
         tranche_sensitivities=list(args.tranche_sensitivities),
         bayes_cv_splits=args.bayes_cv_splits,
